@@ -1,0 +1,8 @@
+# Direct dependencies
+Django==5.2.18
+mysqlclient==2.3.0
+
+# Transitive dependencies (pinned for reproducible installs)
+asgiref==3.13.0
+sqlparse==0.6.0
+tzdata==2026.5
