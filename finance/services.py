@@ -12,6 +12,7 @@ payments" formula for legacy assessments that have no version yet, so existing
 records and the seed keep their exact meaning.
 """
 
+from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from django.core.exceptions import ValidationError
@@ -52,6 +53,28 @@ def _as_decimal(value):
 
 def audit(*, actor, action, detail=""):
     FinanceAuditLog.objects.create(actor=actor, action=action, detail=detail[:500])
+
+
+def local_day_range(date_from, date_to):
+    """Half-open ``[start, end)`` aware-datetime bounds for an INCLUSIVE local-date
+    range in the configured timezone (settings.TIME_ZONE, e.g. Asia/Manila).
+
+    Lets date filtering match the intended calendar day via a plain ``payment_date``
+    comparison (``>= start`` and ``< end``) instead of ``DATE(CONVERT_TZ(...))`` — so it
+    is correct without relying on MySQL timezone tables, and uses the datetime index.
+    ``end`` is midnight immediately after ``date_to`` (so the whole end day is included).
+    Either bound may be ``None`` (open-ended on that side).
+    """
+    tz = timezone.get_current_timezone()
+    start = (
+        timezone.make_aware(datetime.combine(date_from, time.min), tz)
+        if date_from else None
+    )
+    end = (
+        timezone.make_aware(datetime.combine(date_to, time.min), tz) + timedelta(days=1)
+        if date_to else None
+    )
+    return start, end
 
 
 # --------------------------------------------------------------------------
@@ -281,8 +304,10 @@ def revise_assessment(*, assessment, by, reason):
     """Supersede the finalized current version with a new DRAFT version.
 
     Previous versions and their payment allocations are preserved untouched;
-    allocations are never silently moved. Crediting prior payments to the new
-    version requires an explicit authorized reallocation (``reallocate_payment``).
+    allocations are never moved. Prior RECEIVED payments still settle the same
+    assessment, so they carry forward automatically into the balance via
+    ``assessment_amount_paid`` (which sums received allocations across all of the
+    assessment's versions) — no manual reallocation is required.
     """
     assessment = Assessment.objects.select_for_update().get(pk=assessment.pk)
     current = assessment.current_version
@@ -331,10 +356,19 @@ def flag_assessments_for_rule_change(*, fee_rule, by=None):
 # --------------------------------------------------------------------------
 # Payments & allocations
 # --------------------------------------------------------------------------
-def _received_allocations_to(version):
+def _received_allocations_to_assessment(assessment):
+    """Sum RECEIVED payment allocations across ALL versions of this assessment.
+
+    A revision supersedes the current version but leaves prior allocations on it
+    (they are never moved). Those payments are still valid settlements of the
+    *same* assessment, so they carry forward into the current balance. Allocations
+    are read in place and never modified. The ``version__assessment`` filter keeps
+    the sum scoped to this assessment's own versions (no cross-assessment leakage),
+    and ``payment__status=RECEIVED`` excludes PENDING/CANCELLED/REVERSED payments.
+    """
     total = (
         PaymentAllocation.objects.filter(
-            version=version, payment__status=Payment.Status.RECEIVED
+            version__assessment=assessment, payment__status=Payment.Status.RECEIVED
         ).aggregate(total=Sum("amount"))["total"]
     )
     return total if total is not None else ZERO
@@ -553,11 +587,14 @@ def _scholarship_total(assessment):
 
 
 def assessment_amount_paid(*, assessment):
-    """Total settled against the current version (or legacy received payments).
+    """Total settled against this assessment (or legacy received payments).
 
-    = received allocations to the current version + approved credits
-      + approved/applied scholarship − approved refunds.
-    Legacy (no version): sum of RECEIVED payments, preserving original behavior.
+    = received allocations across all of the assessment's versions + approved
+      credits + approved/applied scholarship − approved refunds.
+    Received allocations carry forward across revisions (a payment made against a
+    now-superseded version still settles the same assessment); allocations are
+    never moved. Legacy (no version): sum of RECEIVED payments, preserving the
+    original behavior.
     """
     cv = assessment.current_version
     if cv is None:
@@ -567,7 +604,7 @@ def assessment_amount_paid(*, assessment):
             ).aggregate(total=Sum("amount"))["total"]
         )
         return q2(total if total is not None else ZERO)
-    received = _received_allocations_to(cv)
+    received = _received_allocations_to_assessment(assessment)
     credits = _approved_adjustment_total(assessment, Adjustment.Type.CREDIT)
     scholarship = _scholarship_total(assessment)
     refunds = _approved_adjustment_total(assessment, Adjustment.Type.REFUND)
@@ -603,10 +640,11 @@ def run_reconciliation(*, by, term=None, method="", period_start=None,
         qs = qs.filter(method=method)
     if term is not None:
         qs = qs.filter(assessment__enrollment__term=term)
-    if period_start is not None:
-        qs = qs.filter(payment_date__date__gte=period_start)
-    if period_end is not None:
-        qs = qs.filter(payment_date__date__lte=period_end)
+    start, end = local_day_range(period_start, period_end)
+    if start is not None:
+        qs = qs.filter(payment_date__gte=start)
+    if end is not None:
+        qs = qs.filter(payment_date__lt=end)
     recorded = qs.aggregate(total=Sum("amount"))["total"] or ZERO
     verified = q2(_as_decimal(verified_total)) if verified_total is not None else q2(recorded)
     batch = Reconciliation.objects.create(

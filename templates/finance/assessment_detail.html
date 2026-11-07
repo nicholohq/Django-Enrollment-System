@@ -62,6 +62,7 @@
     {% endif %}
     {% if can_create_adjustment %}
         <a class="btn btn-outline-secondary" href="{% url 'finance:adjustment_create' assessment.pk %}">New Adjustment</a>
+        <a class="btn btn-outline-secondary" href="{% url 'finance:scholarship_create' assessment.pk %}">New Scholarship</a>
     {% endif %}
 </div>
 

@@ -3,7 +3,6 @@
 from django import forms
 
 from accounts.forms import BootstrapFormMixin
-from academics.models import Student
 from finance.models import Adjustment, Payment, ScholarshipAward
 
 
@@ -15,7 +14,17 @@ class PaymentForm(BootstrapFormMixin, forms.Form):
 
 
 class AdjustmentForm(BootstrapFormMixin, forms.Form):
-    adjustment_type = forms.ChoiceField(choices=Adjustment.Type.choices)
+    # Only the two adjustment types that actually affect the balance are offered.
+    # CORRECTION is a non-financial model/annotation type and REVERSAL is created
+    # solely by the payment-reverse flow — neither is selectable here (a tampered
+    # POST with those values fails ChoiceField validation server-side).
+    adjustment_type = forms.ChoiceField(
+        choices=[
+            (Adjustment.Type.CREDIT, Adjustment.Type.CREDIT.label),
+            (Adjustment.Type.REFUND, Adjustment.Type.REFUND.label),
+        ],
+        help_text="Credit reduces the balance; Refund increases the amount owed.",
+    )
     amount = forms.DecimalField(max_digits=12, decimal_places=2, min_value=0.01)
     reason = forms.CharField(max_length=255)
 
@@ -25,14 +34,7 @@ class ReviseAssessmentForm(BootstrapFormMixin, forms.Form):
 
 
 class ScholarshipForm(BootstrapFormMixin, forms.Form):
-    student = forms.ModelChoiceField(
-        queryset=Student.objects.select_related("user").order_by("student_number")
-    )
+    # The student and assessment are derived server-side from the assessment URL
+    # (see finance.views.CreateScholarshipView), never from submitted input.
     sponsor = forms.CharField(max_length=150)
     amount = forms.DecimalField(max_digits=12, decimal_places=2, min_value=0.01)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields["student"].label_from_instance = (
-            lambda s: f"{s.student_number} - {s.user.get_full_name() or s.user.username}"
-        )

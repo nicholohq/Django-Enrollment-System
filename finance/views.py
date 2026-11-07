@@ -255,35 +255,71 @@ class CreateAdjustmentView(FinanceReadMixin, View):
 
 
 class CreateScholarshipView(FinanceReadMixin, View):
+    """Submit a scholarship against a specific assessment (Cashier/Registrar).
+
+    Assessment-scoped like :class:`CreateAdjustmentView`: the student is derived
+    server-side from the assessment (via the URL pk), so a submitted student
+    value can never attach an award to another student's assessment. The award
+    is linked to the assessment and its current version so the authoritative
+    balance (``assessment_balance``) counts it once approved.
+    """
+
     template_name = "finance/scholarship_form.html"
 
     def _check_role(self, request):
         return _role(request) in (User.Role.CASHIER, User.Role.REGISTRAR)
 
-    def get(self, request):
-        if not self._check_role(request):
-            messages.error(request, "You are not permitted to create scholarships.")
-            return redirect("finance:assessment_list")
-        return render(request, self.template_name, {"form": ScholarshipForm()})
+    def _assessment(self, pk):
+        return get_object_or_404(
+            Assessment.objects.select_related("enrollment__student__user"), pk=pk
+        )
 
-    def post(self, request):
+    def _guard(self, request, assessment):
+        """Return a redirect response if submission is not allowed, else None."""
         if not self._check_role(request):
             messages.error(request, "You are not permitted to create scholarships.")
-            return redirect("finance:assessment_list")
+            return redirect("finance:assessment_detail", pk=assessment.pk)
+        if assessment.current_version_id is None:
+            messages.error(
+                request,
+                "This assessment has no active version yet, so a scholarship "
+                "cannot be recorded against it.",
+            )
+            return redirect("finance:assessment_detail", pk=assessment.pk)
+        return None
+
+    def get(self, request, pk):
+        assessment = self._assessment(pk)
+        blocked = self._guard(request, assessment)
+        if blocked is not None:
+            return blocked
+        return render(request, self.template_name, {
+            "assessment": assessment, "form": ScholarshipForm(),
+        })
+
+    def post(self, request, pk):
+        assessment = self._assessment(pk)
+        blocked = self._guard(request, assessment)
+        if blocked is not None:
+            return blocked
         form = ScholarshipForm(request.POST)
         if form.is_valid():
             data = form.cleaned_data
             try:
                 create_scholarship(
-                    student=data["student"], sponsor=data["sponsor"],
-                    amount=data["amount"], by=request.user, is_demo=True,
+                    student=assessment.enrollment.student,
+                    sponsor=data["sponsor"], amount=data["amount"],
+                    by=request.user, assessment=assessment,
+                    version=assessment.current_version, is_demo=False,
                 )
             except ValidationError as exc:
                 form.add_error(None, exc.messages)
             else:
                 messages.success(request, "Scholarship submitted for approval.")
-                return redirect("finance:approvals")
-        return render(request, self.template_name, {"form": form})
+                return redirect("finance:assessment_detail", pk=pk)
+        return render(request, self.template_name, {
+            "assessment": assessment, "form": form,
+        })
 
 
 class ApprovalsView(FinanceApproverMixin, View):

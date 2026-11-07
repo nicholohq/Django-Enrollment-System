@@ -164,6 +164,98 @@ class CollectionReportTests(ReportTestBase):
         self.assertIn("SCHOLARSHIP FUNDING (separate, not cash)", body)
         self.assertIn("2000.00", body)
 
+    # --- Bug 4: collection-report date validation ---
+    # Inclusion totals are deterministic now that filtering uses half-open aware
+    # datetime bounds (Asia/Manila) instead of DATE(CONVERT_TZ(...)) — see
+    # CollectionReportDateBoundaryTests. RC-REC is ₱1,000 on 2026-09-01.
+    def test_valid_start_and_end_accepted(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"),
+                            {"date_from": "2026-09-01", "date_to": "2026-09-30"})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.context["filter_form"].errors)
+        self.assertEqual(r.context["payments_total"], D("1000.00"))
+
+    def test_valid_start_only_accepted(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"), {"date_from": "2026-09-01"})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.context["filter_form"].errors)
+        self.assertEqual(r.context["payments_total"], D("1000.00"))
+
+    def test_valid_end_only_accepted(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"), {"date_to": "2026-09-30"})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.context["filter_form"].errors)
+        self.assertEqual(r.context["payments_total"], D("1000.00"))
+
+    def test_missing_and_empty_dates(self):
+        self.login("rpt_admin")
+        r1 = self.client.get(reverse("reports:collection"))
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r1.context["payments_total"], D("1000.00"))
+        r2 = self.client.get(reverse("reports:collection"),
+                             {"date_from": "", "date_to": ""})
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.context["payments_total"], D("1000.00"))
+
+    def test_malformed_date_no_500(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"), {"date_from": "notadate"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.context["filter_form"].errors)
+        self.assertEqual(r.context["payments_count"], 0)  # invalid -> no results
+
+    def test_impossible_date_no_500(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"), {"date_from": "2026-13-45"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("date_from", r.context["filter_form"].errors)
+
+    def test_reversed_range_validation_error(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"),
+                            {"date_from": "2026-12-31", "date_to": "2026-01-01"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.context["filter_form"].non_field_errors())
+        self.assertEqual(r.context["payments_count"], 0)
+
+    def test_valid_date_filter_still_filters(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"), {"date_from": "2026-09-02"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.context["payments_total"], D("0.00"))  # RC-REC was day 1
+
+    def test_valid_csv_no_filter_has_totals(self):
+        # No date filter -> full data; CSV export still works and includes the total.
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"), {"format": "csv"})
+        self.assertIn("text/csv", r["Content-Type"])
+        self.assertIn("1000.00", r.content.decode("utf-8-sig"))
+
+    def test_valid_date_csv_streams_without_error(self):
+        # A valid date filter still produces a CSV file (no 500), with the totals row.
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"),
+                            {"format": "csv", "date_from": "2026-09-01"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r["Content-Type"])
+        self.assertIn("TOTAL RECORDED COLLECTIONS", r.content.decode("utf-8-sig"))
+
+    def test_invalid_csv_falls_back_to_html_no_file(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"),
+                            {"format": "csv", "date_from": "notadate"})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("text/csv", r["Content-Type"])  # HTML error page, not a CSV file
+        self.assertTrue(r.context["filter_form"].errors)
+
+    def test_submitted_filter_values_preserved(self):
+        self.login("rpt_admin")
+        r = self.client.get(reverse("reports:collection"), {"date_from": "notadate"})
+        self.assertContains(r, 'value="notadate"')  # user's entry retained
+
 
 class ReportPermissionTests(ReportTestBase):
     def test_enrolled_and_semester_access(self):
@@ -192,3 +284,88 @@ class ReportPermissionTests(ReportTestBase):
 
     def test_anonymous_redirected(self):
         self.assertEqual(self.client.get(reverse("reports:index")).status_code, 302)
+
+
+class CollectionReportDateBoundaryTests(ReportTestBase):
+    """Verify Asia/Manila calendar-day boundaries for the collection report using
+    half-open aware-datetime filtering (no DATE(CONVERT_TZ); correct without MySQL
+    timezone tables). Manila = UTC+8, so a Manila day [00:00, next 00:00) maps to
+    UTC [prev 16:00, 16:00). RC-REC from the base fixture is ₱1,000 on 2026-09-01.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+
+        def mkpay(receipt, amount, utc_dt):
+            return Payment.objects.create(
+                assessment=cls.assessment, received_by=cls.cashier,
+                receipt_number=receipt, amount=D(amount),
+                method=Payment.Method.CASH, status=Payment.Status.RECEIVED,
+                payment_date=utc_dt)
+
+        U = dt_tz.utc
+        # All crafted around the Manila day 2026-09-02:
+        cls.p_start = mkpay("B-START", "100", datetime(2026, 9, 1, 16, 0, 0, tzinfo=U))      # Manila 09-02 00:00
+        cls.p_mid = mkpay("B-MID", "100", datetime(2026, 9, 2, 4, 0, 0, tzinfo=U))           # Manila 09-02 12:00
+        cls.p_end = mkpay("B-END", "100", datetime(2026, 9, 2, 15, 59, 59, tzinfo=U))        # Manila 09-02 23:59:59
+        cls.p_prev = mkpay("B-PREV", "100", datetime(2026, 9, 1, 15, 59, 59, tzinfo=U))      # Manila 09-01 23:59:59
+        cls.p_next = mkpay("B-NEXT", "100", datetime(2026, 9, 2, 16, 0, 0, tzinfo=U))        # Manila 09-03 00:00
+
+    def _ctx(self, **params):
+        self.login("rpt_admin")
+        return self.client.get(reverse("reports:collection"), params).context
+
+    def test_same_day_includes_start_mid_end_excludes_adjacent(self):
+        ctx = self._ctx(date_from="2026-09-02", date_to="2026-09-02")
+        # p_start + p_mid + p_end = 300; p_prev, p_next, and RC-REC(09-01) excluded
+        self.assertEqual(ctx["payments_total"], D("300.00"))
+        self.assertEqual(ctx["payments_count"], 3)
+
+    def test_start_boundary_inclusive(self):
+        # a range starting 09-02 includes the Manila-midnight payment (p_start)
+        ctx = self._ctx(date_from="2026-09-02", date_to="2026-09-02")
+        self.assertGreaterEqual(ctx["payments_total"], D("100.00"))
+
+    def test_end_boundary_inclusive(self):
+        # p_end at Manila 23:59:59 on 09-02 is included for date_to=09-02
+        ctx = self._ctx(date_from="2026-09-02", date_to="2026-09-02")
+        receipts_seen = {m["method"] for m in ctx["by_method"]}
+        self.assertIn("CASH", receipts_seen)
+        self.assertEqual(ctx["payments_count"], 3)  # start/mid/end only
+
+    def test_payment_just_after_day_excluded(self):
+        # p_next (Manila 09-03 00:00) must NOT count for 09-02
+        ctx = self._ctx(date_from="2026-09-02", date_to="2026-09-02")
+        self.assertEqual(ctx["payments_count"], 3)  # excludes p_next
+
+    def test_multi_day_range(self):
+        # 09-01..09-03 includes RC-REC(1000) + prev/start/mid/end/next (100 each) = 1500
+        ctx = self._ctx(date_from="2026-09-01", date_to="2026-09-03")
+        self.assertEqual(ctx["payments_total"], D("1500.00"))
+        self.assertEqual(ctx["payments_count"], 6)
+
+    def test_open_ended_start_only(self):
+        # from 09-02 onward: start/mid/end/next = 400 (RC-REC and prev are 09-01)
+        ctx = self._ctx(date_from="2026-09-02")
+        self.assertEqual(ctx["payments_total"], D("400.00"))
+        self.assertEqual(ctx["payments_count"], 4)
+
+    def test_open_ended_end_only(self):
+        # through 09-01: RC-REC(1000) + p_prev(100) = 1100
+        ctx = self._ctx(date_to="2026-09-01")
+        self.assertEqual(ctx["payments_total"], D("1100.00"))
+        self.assertEqual(ctx["payments_count"], 2)
+
+    def test_html_and_csv_consistent(self):
+        self.login("rpt_admin")
+        html = self.client.get(reverse("reports:collection"),
+                               {"date_from": "2026-09-02", "date_to": "2026-09-02"})
+        csv = self.client.get(reverse("reports:collection"),
+                              {"date_from": "2026-09-02", "date_to": "2026-09-02",
+                               "format": "csv"})
+        self.assertEqual(html.context["payments_total"], D("300.00"))
+        body = csv.content.decode("utf-8-sig")
+        self.assertIn("text/csv", csv["Content-Type"])
+        # CSV total row carries the same figure as the HTML context
+        self.assertIn("300.00", body)

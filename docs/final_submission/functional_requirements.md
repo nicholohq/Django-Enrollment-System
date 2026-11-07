@@ -102,7 +102,7 @@ server-side permission mixins/decorators in `accounts/permissions.py`.
 - **Status:** **Implemented.** **Evidence:** finance payment/allocation tests; live HTTP (record payment page 200).
 
 ### FR-D4 — Balance calculation and updates
-- **Actual:** One authoritative service (`assessment_balance`): current-version total − received allocations − approved credits − approved scholarship + approved refunds. Pending/cancelled/reversed never count; legacy assessments use a compatible fallback.
+- **Actual:** One authoritative service (`assessment_balance`): current-version total − received allocations across the assessment's versions − approved credits − approved scholarship + approved refunds. Received payments carry forward across revisions (allocations are never moved). Pending/cancelled/reversed never count; legacy assessments use a compatible fallback.
 - **Status:** **Implemented.** **Evidence:** finance balance tests; seed scenario balances verified (e.g., S06 2,950; S07 0; S08 reversed unchanged).
 
 ---

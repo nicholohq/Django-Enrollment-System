@@ -6,7 +6,7 @@ app_name = "finance"
 
 urlpatterns = [
     path("", views.AssessmentListView.as_view(), name="assessment_list"),
-    path("scholarships/new/", views.CreateScholarshipView.as_view(), name="scholarship_create"),
+    path("assessment/<int:pk>/scholarship/new/", views.CreateScholarshipView.as_view(), name="scholarship_create"),
     path("approvals/", views.ApprovalsView.as_view(), name="approvals"),
     path("approvals/adjustment/<int:pk>/<str:action>/", views.AdjustmentActionView.as_view(), name="adjustment_action"),
     path("approvals/scholarship/<int:pk>/<str:action>/", views.ScholarshipActionView.as_view(), name="scholarship_action"),

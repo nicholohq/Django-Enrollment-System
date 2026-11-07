@@ -162,14 +162,15 @@ even if the rule later changes.
 
 **Payment allocation.** Money is linked to a specific version through explicit
 `PaymentAllocation` rows (never implicitly), so a payment is traceable and never
-double-counted. On revision, allocations stay on their original version
-(reallocation is an explicit authorized action).
+double-counted. On revision, allocations stay on their original version (they are
+never moved); prior RECEIVED payments carry forward into the balance because the
+paid amount is summed across all of the assessment's versions.
 
 **Authoritative balance.** `assessment_balance` =
-`current_version.total − received allocations to current version − approved
-credits − approved/applied scholarship + approved refunds`. PENDING/CANCELLED/
-REVERSED payments never count. Legacy assessments (no version) use a compatible
-`total_amount − RECEIVED payments` fallback.
+`current_version.total − received allocations across the assessment's versions −
+approved credits − approved/applied scholarship + approved refunds`. PENDING/
+CANCELLED/REVERSED payments never count. Legacy assessments (no version) use a
+compatible `total_amount − RECEIVED payments` fallback.
 
 **Integrity controls.** Adjustments and scholarships require approval with a
 database-enforced **creator ≠ approver** rule; reversals mark a payment REVERSED

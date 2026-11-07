@@ -2,7 +2,14 @@
 {% block title %}New Scholarship{% endblock %}
 {% block content %}
 <h2>New Scholarship</h2>
-<p class="text-muted">Scholarship funding is kept distinct from cash/electronic payments and requires administrator approval. DEMO data.</p>
+<p class="text-muted">Scholarship funding is kept distinct from cash/electronic payments and requires administrator approval.</p>
+<dl class="row">
+    <dt class="col-sm-3">Student</dt>
+    <dd class="col-sm-9">{{ assessment.enrollment.student.user.get_full_name|default:assessment.enrollment.student.user.username }}
+        ({{ assessment.enrollment.student.student_number }})</dd>
+    <dt class="col-sm-3">Assessment</dt>
+    <dd class="col-sm-9">#{{ assessment.pk }} — {{ assessment.enrollment.term }}</dd>
+</dl>
 <form method="post" novalidate>
     {% csrf_token %}
     {% if form.non_field_errors %}<div class="alert alert-danger">{% for e in form.non_field_errors %}<div>{{ e }}</div>{% endfor %}</div>{% endif %}
@@ -15,7 +22,7 @@
     {% endfor %}
     <div class="htu-form-actions">
         <button type="submit" class="btn btn-primary">Submit for Approval</button>
-        <a class="btn btn-outline-secondary" href="{% url 'finance:assessment_list' %}">Cancel</a>
+        <a class="btn btn-outline-secondary" href="{% url 'finance:assessment_detail' assessment.pk %}">Cancel</a>
     </div>
 </form>
 {% endblock %}

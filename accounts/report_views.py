@@ -13,6 +13,7 @@ print CSS) for browser "Save as PDF".
 import csv
 from decimal import Decimal
 
+from django import forms
 from django.db.models import Count, Sum
 from django.http import HttpResponse
 from django.shortcuts import render
@@ -23,6 +24,7 @@ from accounts.permissions import role_required
 from academics.models import AcademicTerm, College, Course, Program
 from enrollment.models import Enrollment, EnrollmentDetail
 from finance.models import Payment, ScholarshipAward
+from finance.services import local_day_range
 from scheduling.models import Section
 
 ZERO = Decimal("0.00")
@@ -198,24 +200,45 @@ def semester_report(request):
 
 
 # --- Report C: collection report ------------------------------------------
-def _collection_data(request):
+class CollectionReportFilterForm(forms.Form):
+    """Validate the optional collection-report date range.
+
+    Using Django's own ``DateField`` validation means a malformed (``notadate``)
+    or impossible (``2026-13-45``) value is reported as a clear field error
+    instead of raising an unhandled error inside the ORM date lookup (HTTP 500).
+    Both fields are optional, so missing/empty dates simply apply no date filter.
+    """
+
+    date_from = forms.DateField(required=False)
+    date_to = forms.DateField(required=False)
+
+    def clean(self):
+        cleaned = super().clean()
+        start, end = cleaned.get("date_from"), cleaned.get("date_to")
+        if start and end and start > end:
+            raise forms.ValidationError(
+                "The start date must be on or before the end date."
+            )
+        return cleaned
+
+
+def _collection_data(request, *, date_from=None, date_to=None):
     payments = Payment.objects.filter(status=Payment.Status.RECEIVED)
     scholarships = ScholarshipAward.objects.filter(
         status__in=[ScholarshipAward.Status.APPROVED, ScholarshipAward.Status.APPLIED]
     )
     term = _int(request, "term")
     method = request.GET.get("method") or None
-    date_from = request.GET.get("date_from") or None
-    date_to = request.GET.get("date_to") or None
     if term:
         payments = payments.filter(assessment__enrollment__term_id=term)
         scholarships = scholarships.filter(assessment__enrollment__term_id=term)
     if method:
         payments = payments.filter(method=method)
-    if date_from:
-        payments = payments.filter(payment_date__date__gte=date_from)
-    if date_to:
-        payments = payments.filter(payment_date__date__lte=date_to)
+    start, end = local_day_range(date_from, date_to)
+    if start:
+        payments = payments.filter(payment_date__gte=start)
+    if end:
+        payments = payments.filter(payment_date__lt=end)
 
     by_method = list(
         payments.values("method").annotate(
@@ -235,18 +258,34 @@ def _collection_data(request):
 
 @role_required(User.Role.CASHIER, User.Role.ADMINISTRATOR)
 def collection_report(request):
-    data = _collection_data(request)
-    if request.GET.get("format") == "csv":
-        header = ["Payment Method", "Confirmed Count", "Confirmed Amount"]
-        rows = [[m["method"], m["count"], _money(m["total"])] for m in data["by_method"]]
-        rows.append(["TOTAL RECORDED COLLECTIONS", data["payments_count"], _money(data["payments_total"])])
-        rows.append(["SCHOLARSHIP FUNDING (separate, not cash)", data["scholarship_count"], _money(data["scholarship_total"])])
-        return _csv_response(f"collection-report-{_stamp()}.csv", header, rows)
+    filter_form = CollectionReportFilterForm(request.GET)
+    valid = filter_form.is_valid()
+    if valid:
+        data = _collection_data(
+            request,
+            date_from=filter_form.cleaned_data.get("date_from"),
+            date_to=filter_form.cleaned_data.get("date_to"),
+        )
+        # CSV export only for valid filters; invalid input never streams a file
+        # or runs an unrestricted report (it falls through to the HTML page).
+        if request.GET.get("format") == "csv":
+            header = ["Payment Method", "Confirmed Count", "Confirmed Amount"]
+            rows = [[m["method"], m["count"], _money(m["total"])] for m in data["by_method"]]
+            rows.append(["TOTAL RECORDED COLLECTIONS", data["payments_count"], _money(data["payments_total"])])
+            rows.append(["SCHOLARSHIP FUNDING (separate, not cash)", data["scholarship_count"], _money(data["scholarship_total"])])
+            return _csv_response(f"collection-report-{_stamp()}.csv", header, rows)
+    else:
+        # Invalid dates: show the page with validation errors and no results.
+        data = {
+            "by_method": [], "payments_total": ZERO, "payments_count": 0,
+            "scholarship_total": ZERO, "scholarship_count": 0,
+        }
     context = {
         **data,
         "method_choices": Payment.Method.choices,
         "terms": AcademicTerm.objects.all(),
         "filters": request.GET,
+        "filter_form": filter_form,
         "generated_at": timezone.localtime(),
         "title": "Collection Report",
         "csv_url": "?" + request.GET.urlencode() + ("&" if request.GET else "") + "format=csv",
